@@ -4,43 +4,25 @@ import { readdir } from "fs/promises";
 import { join, basename, dirname } from "path";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
+import { getProjectsDir, Logger } from "./src";
+import type { MessageContent, JSONLRecord, TextEntry } from "./src";
 
-interface MessageContent {
-  type: string;
-  text?: string;
-}
-
-interface JSONLRecord {
-  type?: string;
-  message?: {
-    role?: string;
-    content?: string | MessageContent[];
-  };
-  timestamp?: string;
-  sessionId?: string;
-  cwd?: string;
-}
-
-interface TextEntry {
-  text: string;
-  filePath: string;
-  projectPath: string;
-  cwd?: string;
-  timestamp?: string;
-  role?: string;
-  sessionId?: string;
-}
+const logger = new Logger('extract-metadata');
 
 async function* walkDir(dir: string): AsyncGenerator<string> {
-  const entries = await readdir(dir, { withFileTypes: true });
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
 
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      yield* walkDir(fullPath);
-    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-      yield fullPath;
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        yield* walkDir(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        yield fullPath;
+      }
     }
+  } catch (error) {
+    logger.error(`Failed to read directory: ${dir}`, error as Error);
   }
 }
 
@@ -51,7 +33,6 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<TextEntry>
     crlfDelay: Infinity,
   });
 
-  // Extract project path from file path
   const fileName = basename(filePath, '.jsonl');
   const parentDir = dirname(filePath);
   const projectPath = basename(parentDir);
@@ -62,18 +43,15 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<TextEntry>
     try {
       const record: JSONLRecord = JSON.parse(line);
 
-      // Extract text from message content
       if (record.message?.content) {
         const content = record.message.content;
         const texts: string[] = [];
 
         if (typeof content === 'string') {
-          // Simple string content
           if (content.trim()) {
             texts.push(content);
           }
         } else if (Array.isArray(content)) {
-          // Array of content blocks
           for (const block of content) {
             if (block.type === 'text' && block.text?.trim()) {
               texts.push(block.text);
@@ -81,7 +59,6 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<TextEntry>
           }
         }
 
-        // Yield each text with metadata
         for (const text of texts) {
           yield {
             text,
@@ -95,31 +72,23 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<TextEntry>
         }
       }
     } catch (error) {
-      // Skip invalid JSON lines
-      continue;
+      logger.skippedLine(line, error as Error);
     }
   }
 }
 
 async function main() {
-  const projectsDir = join(process.env.HOME || '~', '.claude', 'projects');
-  const entries: TextEntry[] = [];
-
   try {
-    // Collect all entries
+    const projectsDir = getProjectsDir();
+
     for await (const filePath of walkDir(projectsDir)) {
       for await (const entry of extractTextFromFile(filePath)) {
-        entries.push(entry);
+        console.log(JSON.stringify(entry));
       }
     }
-
-    // Output as JSONL for later processing
-    for (const entry of entries) {
-      console.log(JSON.stringify(entry));
-    }
   } catch (error) {
-    console.error('Error extracting text:', error);
-    process.exit(1);
+    logger.error('Error extracting text', error as Error);
+    process.exitCode = 1;
   }
 }
 

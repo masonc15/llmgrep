@@ -4,33 +4,26 @@ import { readdir } from "fs/promises";
 import { join } from "path";
 import { createReadStream } from "fs";
 import { createInterface } from "readline";
+import { getProjectsDir } from "./src";
+import { Logger } from "./src";
+import type { MessageContent, JSONLRecord } from "./src";
 
-interface MessageContent {
-  type: string;
-  text?: string;
-}
-
-interface JSONLRecord {
-  type?: string;
-  message?: {
-    role?: string;
-    content?: string | MessageContent[];
-  };
-  timestamp?: string;
-  sessionId?: string;
-  cwd?: string;
-}
+const logger = new Logger('extract-text');
 
 async function* walkDir(dir: string): AsyncGenerator<string> {
-  const entries = await readdir(dir, { withFileTypes: true });
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
 
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      yield* walkDir(fullPath);
-    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-      yield fullPath;
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        yield* walkDir(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        yield fullPath;
+      }
     }
+  } catch (error) {
+    logger.error(`Failed to read directory: ${dir}`, error as Error);
   }
 }
 
@@ -47,17 +40,14 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<string> {
     try {
       const record: JSONLRecord = JSON.parse(line);
 
-      // Extract text from message content
       if (record.message?.content) {
         const content = record.message.content;
 
         if (typeof content === 'string') {
-          // Simple string content
           if (content.trim()) {
             yield content;
           }
         } else if (Array.isArray(content)) {
-          // Array of content blocks
           for (const block of content) {
             if (block.type === 'text' && block.text?.trim()) {
               yield block.text;
@@ -66,26 +56,23 @@ async function* extractTextFromFile(filePath: string): AsyncGenerator<string> {
         }
       }
     } catch (error) {
-      // Skip invalid JSON lines
-      continue;
+      logger.skippedLine(line, error as Error);
     }
   }
 }
 
 async function main() {
-  const projectsDir = join(process.env.HOME || '~', '.claude', 'projects');
-
   try {
+    const projectsDir = getProjectsDir();
+
     for await (const filePath of walkDir(projectsDir)) {
       for await (const text of extractTextFromFile(filePath)) {
-        // Output one line per text entry for search to consume
-        // Replace newlines with spaces to keep each entry on one line
         console.log(text.replace(/\n/g, ' '));
       }
     }
   } catch (error) {
-    console.error('Error extracting text:', error);
-    process.exit(1);
+    logger.error('Error extracting text', error as Error);
+    process.exitCode = 1;
   }
 }
 
