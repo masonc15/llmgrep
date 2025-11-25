@@ -1,41 +1,18 @@
 #!/usr/bin/env bun
 
-import { spawn } from "child_process";
 import { join } from "path";
+import {
+  parseArgs,
+  validateSearchOptions,
+  pipeProcesses,
+  Logger,
+  setDebugMode,
+  DEFAULT_TOP_K,
+  DEFAULT_CONTEXT,
+} from "./src";
 
-interface SearchOptions {
-  topK?: number;
-  maxDistance?: number;
-  context?: number;
-}
-
-function parseArgs(args: string[]): { query: string; options: SearchOptions } {
-  const options: SearchOptions = {
-    topK: 3,
-    context: 3,
-  };
-
-  let query = '';
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-
-    if (arg === '--top-k' && i + 1 < args.length) {
-      options.topK = parseInt(args[++i], 10);
-    } else if (arg === '--max-distance' && i + 1 < args.length) {
-      options.maxDistance = parseFloat(args[++i]);
-    } else if (arg === '--context' && i + 1 < args.length) {
-      options.context = parseInt(args[++i], 10);
-    } else if (arg === '--help' || arg === '-h') {
-      printHelp();
-      process.exit(0);
-    } else if (!arg.startsWith('--')) {
-      query = arg;
-    }
-  }
-
-  return { query, options };
-}
+const logger = new Logger('llmgrep');
+const SEARCH_TIMEOUT = 120000; // 2 minutes
 
 function printHelp() {
   console.log(`
@@ -47,9 +24,10 @@ Arguments:
   <query>               Search query (semantic matching)
 
 Options:
-  --top-k <number>      Number of results to return (default: 3)
+  --top-k <number>      Number of results to return (default: ${DEFAULT_TOP_K})
   --max-distance <num>  Maximum cosine distance threshold (0.0+)
-  --context <number>    Lines of context before/after match (default: 3)
+  --context <number>    Lines of context before/after match (default: ${DEFAULT_CONTEXT})
+  --debug               Enable debug logging
   -h, --help           Show this help message
 
 Examples:
@@ -62,10 +40,22 @@ Examples:
 async function main() {
   const args = process.argv.slice(2);
 
+  // Check for debug flag
+  if (args.includes('--debug')) {
+    setDebugMode(true);
+    args.splice(args.indexOf('--debug'), 1);
+  }
+
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp();
+    return;
+  }
+
   if (args.length === 0) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const { query, options } = parseArgs(args);
@@ -73,7 +63,17 @@ async function main() {
   if (!query) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    validateSearchOptions(options);
+  } catch (error) {
+    console.error(`Error: ${(error as Error).message}\n`);
+    printHelp();
+    process.exitCode = 1;
+    return;
   }
 
   // Build search command arguments
@@ -85,35 +85,42 @@ async function main() {
     searchArgs.push('--top-k', options.topK!.toString());
   }
 
-  // Run extract-text.ts and pipe to search
   const extractScript = join(import.meta.dir, 'extract-text.ts');
 
-  const extract = spawn('bun', ['run', extractScript], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
+  try {
+    const result = await pipeProcesses({
+      source: { cmd: ['bun', 'run', extractScript] },
+      sink: { cmd: ['search', ...searchArgs] },
+      timeout: SEARCH_TIMEOUT,
+    });
 
-  const search = spawn('search', searchArgs, {
-    stdio: ['pipe', 'inherit', 'inherit'],
-  });
+    if (result.timedOut) {
+      logger.error('Search timed out after 2 minutes');
+      process.exitCode = 1;
+      return;
+    }
 
-  // Pipe extraction output to search input
-  extract.stdout.pipe(search.stdin);
+    if (result.sourceExitCode !== 0) {
+      logger.error(`Extraction failed with code ${result.sourceExitCode}`);
+      process.exitCode = 1;
+      return;
+    }
 
-  // Handle errors
-  extract.on('error', (error) => {
-    console.error('Error running extraction:', error);
-    process.exit(1);
-  });
+    if (result.exitCode !== 0) {
+      logger.error(`Search failed with code ${result.exitCode}`);
+      console.error('Make sure "search" command is installed (npm install -g @llamaindex/semtools)');
+      process.exitCode = result.exitCode;
+      return;
+    }
 
-  search.on('error', (error) => {
-    console.error('Error running search:', error);
-    console.error('Make sure "search" command is installed (npm install -g @llamaindex/semtools)');
-    process.exit(1);
-  });
-
-  search.on('close', (code) => {
-    process.exit(code || 0);
-  });
+    // Output results
+    if (result.stdout) {
+      console.log(result.stdout);
+    }
+  } catch (error) {
+    logger.error('Search failed', error as Error);
+    process.exitCode = 1;
+  }
 }
 
 main();
