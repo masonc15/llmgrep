@@ -2,58 +2,33 @@
 
 import { spawn } from "child_process";
 import { join } from "path";
-import { createReadStream, createWriteStream } from "fs";
+import { createWriteStream } from "fs";
 import { createInterface } from "readline";
-import { tmpdir } from "os";
 import { select } from "@inquirer/prompts";
 import { ExitPromptError } from "@inquirer/core";
 import { extractConversation } from "./extract-conversation";
+import {
+  parseArgs,
+  validateSearchOptions,
+  truncate,
+  getGlobalTempManager,
+  parseSearchOutput,
+  attachEntries,
+  sortByDistance,
+  Logger,
+  setDebugMode,
+  INTERACTIVE_TOP_K,
+  MAX_RESULTS_DISPLAY,
+  TRUNCATE_PREVIEW_LENGTH,
+  DISTANCE_THRESHOLDS,
+  AUTO_REFINE_MAX_ATTEMPTS,
+  OPTIMAL_RESULT_MIN,
+  BINARY_SEARCH_PRECISION,
+} from "./src";
+import type { SearchOptions, TextEntry, SearchResult } from "./src";
 
-interface SearchOptions {
-  topK?: number;
-  maxDistance?: number;
-}
-
-interface TextEntry {
-  text: string;
-  filePath: string;
-  projectPath: string;
-  cwd?: string;
-  timestamp?: string;
-  role?: string;
-  sessionId?: string;
-}
-
-interface SearchResult {
-  lineNumber: number;
-  distance: number;
-  entry: TextEntry;
-}
-
-function parseArgs(args: string[]): { query: string; options: SearchOptions } {
-  const options: SearchOptions = {
-    topK: 1000, // Large number to get all results, will warn if > 25
-  };
-
-  let query = '';
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-
-    if (arg === '--top-k' && i + 1 < args.length) {
-      options.topK = parseInt(args[++i], 10);
-    } else if (arg === '--max-distance' && i + 1 < args.length) {
-      options.maxDistance = parseFloat(args[++i]);
-    } else if (arg === '--help' || arg === '-h') {
-      printHelp();
-      process.exit(0);
-    } else if (!arg.startsWith('--')) {
-      query = arg;
-    }
-  }
-
-  return { query, options };
-}
+const logger = new Logger('interactive-search');
+const tempManager = getGlobalTempManager();
 
 function printHelp() {
   console.log(`
@@ -69,7 +44,8 @@ Options:
                         Recommended values based on testing:
                         - 0.4 for precision (fewer, more relevant results)
                         - 0.5 for recall (more results, broader matches)
-  --top-k <number>      Max results (default: 1000, warns if >25)
+  --top-k <number>      Max results (default: ${INTERACTIVE_TOP_K}, warns if >${MAX_RESULTS_DISPLAY})
+  --debug               Enable debug logging
   -h, --help           Show this help message
 
 Examples:
@@ -81,7 +57,7 @@ Examples:
 
 async function extractMetadata(): Promise<{ entries: TextEntry[]; tempFile: string }> {
   const extractScript = join(import.meta.dir, 'extract-with-metadata.ts');
-  const tempFile = join(tmpdir(), `llmgrep-${Date.now()}.txt`);
+  const tempFile = await tempManager.create('llmgrep');
 
   return new Promise((resolve, reject) => {
     const entries: TextEntry[] = [];
@@ -102,7 +78,7 @@ async function extractMetadata(): Promise<{ entries: TextEntry[]; tempFile: stri
         entries.push(entry);
         textLines.push(entry.text.replace(/\n/g, ' '));
       } catch (error) {
-        // Skip invalid lines
+        logger.skippedLine(line, error as Error);
       }
     });
 
@@ -159,33 +135,13 @@ async function performSearch(
         return;
       }
 
-      const results: SearchResult[] = [];
-      const lines = output.split('\n');
-
-      for (const line of lines) {
-        const match = line.match(/^[^:]+:(\d+)::(\d+)\s+\(([0-9.]+)\)/);
-        if (match) {
-          results.push({
-            lineNumber: parseInt(match[1], 10),
-            distance: parseFloat(match[3]),
-            entry: null as any, // Will be filled in
-          });
-        }
-      }
-
-      resolve(results);
+      resolve(parseSearchOutput(output));
     });
   });
 }
 
-function truncate(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-  return text.substring(0, maxLength - 3) + '...';
-}
-
 async function copyToClipboard(text: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    // Use pbcopy on macOS, xclip on Linux, clip on Windows
     let command: string;
     let args: string[] = [];
 
@@ -225,7 +181,7 @@ async function handleTooManyResults(
   entries: TextEntry[],
   tempFile: string
 ): Promise<void> {
-  console.log(`\n⚠️  Too many results (${resultCount}).`);
+  console.log(`\nToo many results (${resultCount}).`);
 
   let choice: string | number;
   try {
@@ -233,27 +189,27 @@ async function handleTooManyResults(
       message: 'How would you like to refine your search?',
       choices: [
         {
-          name: '🎯 Auto - Automatically find optimal distance (recommended)',
+          name: 'Auto - Automatically find optimal distance (recommended)',
           value: 'auto',
           description: 'Tries distances from 0.3 to 0.5 until results fit',
         },
         {
-          name: '🔍 Distance 0.3 - Very specific (exact matches)',
+          name: 'Distance 0.3 - Very specific (exact matches)',
           value: 0.3,
           description: 'Most restrictive, fewest results',
         },
         {
-          name: '🎪 Distance 0.4 - Precision (recommended)',
+          name: 'Distance 0.4 - Precision (recommended)',
           value: 0.4,
           description: 'Good balance of relevance and results',
         },
         {
-          name: '🌊 Distance 0.5 - Recall (broader)',
+          name: 'Distance 0.5 - Recall (broader)',
           value: 0.5,
           description: 'More results, broader matches',
         },
         {
-          name: '❌ Cancel',
+          name: 'Cancel',
           value: 'cancel',
           description: 'Exit search',
         },
@@ -262,21 +218,20 @@ async function handleTooManyResults(
   } catch (error) {
     if (error instanceof ExitPromptError) {
       console.log('\n\nSearch cancelled.');
-      process.exit(0);
+      return;
     }
     throw error;
   }
 
   if (choice === 'cancel') {
     console.log('\nSearch cancelled.');
-    process.exit(0);
+    return;
   }
 
   if (choice === 'auto') {
     return await autoRefineSearch(query, entries, tempFile);
   }
 
-  // Manual distance selection
   console.log(`\nSearching with distance ${choice}...`);
   const results = await performSearch(tempFile, query, { maxDistance: choice as number });
 
@@ -285,12 +240,11 @@ async function handleTooManyResults(
     return await handleTooManyResults(0, query, entries, tempFile);
   }
 
-  if (results.length > 25) {
+  if (results.length > MAX_RESULTS_DISPLAY) {
     console.log(`\nStill too many results (${results.length}).`);
     return await handleTooManyResults(results.length, query, entries, tempFile);
   }
 
-  // Continue with normal flow
   await displayResultsAndCopy(results, entries, query, tempFile, choice as number);
 }
 
@@ -298,19 +252,17 @@ async function autoRefineSearch(
   query: string,
   entries: TextEntry[],
   tempFile: string,
-  maxAttempts: number = 15
+  maxAttempts: number = AUTO_REFINE_MAX_ATTEMPTS
 ): Promise<void> {
-  console.log('\n🔄 Auto-refining search...\n');
+  console.log('\nAuto-refining search...\n');
 
-  const distances = [0.3, 0.35, 0.4, 0.45, 0.5];
   let attempt = 0;
   let lastGoodDistance: number | null = null;
   let lastGoodCount = 0;
-  let lastTooManyDistance: number | null = null;
 
-  for (const distance of distances) {
+  for (const distance of DISTANCE_THRESHOLDS) {
     if (attempt++ >= maxAttempts) {
-      console.log('\n⚠️  Max refinement attempts reached.');
+      console.log('\nMax refinement attempts reached.');
       if (lastGoodDistance) {
         console.log(`Using best result with ${lastGoodCount} matches at distance ${lastGoodDistance}.\n`);
         const results = await performSearch(tempFile, query, { maxDistance: lastGoodDistance });
@@ -318,7 +270,7 @@ async function autoRefineSearch(
         return;
       }
       console.log('Please try a more specific query.');
-      process.exit(0);
+      return;
     }
 
     console.log(`  Trying distance ${distance}...`);
@@ -329,21 +281,18 @@ async function autoRefineSearch(
       continue;
     }
 
-    if (results.length <= 25) {
-      console.log(`    ✅ Found ${results.length} results!\n`);
+    if (results.length <= MAX_RESULTS_DISPLAY) {
+      console.log(`    Found ${results.length} results!\n`);
       await displayResultsAndCopy(results, entries, query, tempFile, distance);
       return;
     }
 
     console.log(`    Too many (${results.length}), trying stricter...`);
 
-    // If we jumped from few/none to too many, or have a previous good distance
-    if (lastGoodDistance !== null && lastGoodCount < 25) {
-      lastTooManyDistance = distance;
-      console.log(`  📊 Detected jump from ${lastGoodCount} to ${results.length} results.`);
-      console.log(`  🎯 Fine-tuning between ${lastGoodDistance} and ${distance}...\n`);
+    if (lastGoodDistance !== null && lastGoodCount < MAX_RESULTS_DISPLAY) {
+      console.log(`  Detected jump from ${lastGoodCount} to ${results.length} results.`);
+      console.log(`  Fine-tuning between ${lastGoodDistance} and ${distance}...\n`);
 
-      // Binary search between lastGoodDistance and current distance
       const refined = await binarySearchDistance(
         query,
         entries,
@@ -358,14 +307,12 @@ async function autoRefineSearch(
       }
     }
 
-    // Track this as potentially useful for fine-tuning
-    if (results.length <= 25) {
+    if (results.length <= MAX_RESULTS_DISPLAY) {
       lastGoodDistance = distance;
       lastGoodCount = results.length;
     }
   }
 
-  // If we got here and have a lastGoodDistance, use it
   if (lastGoodDistance) {
     console.log(`\nUsing best result with ${lastGoodCount} matches at distance ${lastGoodDistance}.\n`);
     const results = await performSearch(tempFile, query, { maxDistance: lastGoodDistance });
@@ -373,9 +320,8 @@ async function autoRefineSearch(
     return;
   }
 
-  console.log('\n⚠️  Could not find a good distance threshold automatically.');
+  console.log('\nCould not find a good distance threshold automatically.');
   console.log('Try refining your query or using a manual distance setting.');
-  process.exit(0);
 }
 
 async function binarySearchDistance(
@@ -392,7 +338,7 @@ async function binarySearchDistance(
   let bestCount = 0;
   let attempts = 0;
 
-  while (attempts < remainingAttempts && right - left > 0.02) {
+  while (attempts < remainingAttempts && right - left > BINARY_SEARCH_PRECISION) {
     const mid = (left + right) / 2;
     attempts++;
 
@@ -405,19 +351,17 @@ async function binarySearchDistance(
       continue;
     }
 
-    if (results.length <= 25) {
+    if (results.length <= MAX_RESULTS_DISPLAY) {
       console.log(`      Good! ${results.length} results.`);
       bestDistance = mid;
       bestCount = results.length;
 
-      // If we're close to 25, this is great - use it
-      if (results.length >= 15) {
-        console.log(`    ✅ Found optimal: ${results.length} results at distance ${bestDistance.toFixed(2)}!\n`);
+      if (results.length >= OPTIMAL_RESULT_MIN) {
+        console.log(`    Found optimal: ${results.length} results at distance ${bestDistance.toFixed(2)}!\n`);
         await displayResultsAndCopy(results, entries, query, tempFile, bestDistance);
         return true;
       }
 
-      // Try to get more results
       left = mid;
     } else {
       console.log(`      Too many (${results.length}), going lower...`);
@@ -425,9 +369,8 @@ async function binarySearchDistance(
     }
   }
 
-  // Use the best we found
   if (bestCount > 0) {
-    console.log(`    ✅ Found ${bestCount} results at distance ${bestDistance.toFixed(2)}!\n`);
+    console.log(`    Found ${bestCount} results at distance ${bestDistance.toFixed(2)}!\n`);
     const results = await performSearch(tempFile, query, { maxDistance: bestDistance });
     await displayResultsAndCopy(results, entries, query, tempFile, bestDistance);
     return true;
@@ -443,67 +386,57 @@ async function displayResultsAndCopy(
   tempFile?: string,
   currentDistance?: number
 ): Promise<void> {
-  // Attach entries to results
-  for (const result of results) {
-    result.entry = entries[result.lineNumber];
-  }
+  const resultsWithEntries = sortByDistance(attachEntries(results, entries));
 
-  // Sort by distance (best matches first)
-  results.sort((a, b) => a.distance - b.distance);
-
-  console.log(`Found ${results.length} result(s).`);
+  console.log(`Found ${resultsWithEntries.length} result(s).`);
   console.log(`Select one to copy the full conversation to clipboard:\n`);
 
-  // Group results by cwd
-  const groupedByCwd = results.reduce((groups, result) => {
-    const cwd = result.entry.cwd || 'Unknown';
+  const groupedByCwd = resultsWithEntries.reduce((groups, result) => {
+    const cwd = result.entry?.cwd || 'Unknown';
     if (!groups[cwd]) {
       groups[cwd] = [];
     }
     groups[cwd].push(result);
     return groups;
-  }, {} as Record<string, typeof results>);
+  }, {} as Record<string, typeof resultsWithEntries>);
 
-  // Create choices with separators for each cwd group
-  const choices: any[] = [];
+  const choices: Array<{ name: string; value: number; disabled?: boolean; description?: string }> = [];
   const cwds = Object.keys(groupedByCwd).sort();
 
-  cwds.forEach((cwd, cwdIndex) => {
-    // Add separator for each group
+  cwds.forEach((cwd) => {
     const cwdShort = cwd.split('/').slice(-2).join('/');
     choices.push({
-      name: `\n─────── ${cwdShort} ───────`,
+      name: `\n------- ${cwdShort} -------`,
       value: -2,
       disabled: true,
     });
 
-    // Add results for this cwd
-    groupedByCwd[cwd].forEach((result, localIndex) => {
+    groupedByCwd[cwd]!.forEach((result) => {
       const entry = result.entry;
+      if (!entry) return;
+
       const date = entry.timestamp ? new Date(entry.timestamp).toLocaleDateString() : 'Unknown';
       const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-      const preview = truncate(entry.text, 150);
+      const preview = truncate(entry.text, TRUNCATE_PREVIEW_LENGTH);
 
       choices.push({
         name: `  ${date} ${time} | ${entry.role?.toUpperCase() || 'N/A'} [${(result.distance * 100).toFixed(1)}%]\n    ${preview}`,
-        value: results.indexOf(result), // Use global index
+        value: resultsWithEntries.indexOf(result),
         description: `Full path: ${entry.cwd || 'N/A'} | Distance: ${result.distance.toFixed(4)}`,
       });
     });
   });
 
-  // Add "go broader" option if we have few results and can go broader
-  if (results.length < 25 && tempFile && currentDistance && currentDistance < 0.6) {
+  if (resultsWithEntries.length < MAX_RESULTS_DISPLAY && tempFile && currentDistance && currentDistance < 0.6) {
     choices.push({
-      name: '\n🌊 Go Broader - Search with higher distance threshold',
+      name: '\nGo Broader - Search with higher distance threshold',
       value: -3,
       description: `Try distance ${(currentDistance + 0.1).toFixed(1)} for more results`,
     });
   }
 
-  // Add cancel option
   choices.push({
-    name: '❌ Cancel',
+    name: 'Cancel',
     value: -1,
     description: 'Exit without copying',
   });
@@ -518,17 +451,16 @@ async function displayResultsAndCopy(
   } catch (error) {
     if (error instanceof ExitPromptError) {
       console.log('\n\nCancelled.');
-      process.exit(0);
+      return;
     }
     throw error;
   }
 
   if (selectedIndex === -1) {
     console.log('\nCancelled.');
-    process.exit(0);
+    return;
   }
 
-  // Handle "go broader" option
   if (selectedIndex === -3 && tempFile && currentDistance) {
     const newDistance = currentDistance + 0.1;
     console.log(`\nSearching with broader distance ${newDistance.toFixed(1)}...`);
@@ -539,46 +471,72 @@ async function displayResultsAndCopy(
       return await displayResultsAndCopy(results, entries, query, tempFile, currentDistance);
     }
 
-    if (newResults.length > 25) {
+    if (newResults.length > MAX_RESULTS_DISPLAY) {
       return await handleTooManyResults(newResults.length, query, entries, tempFile);
     }
 
     return await displayResultsAndCopy(newResults, entries, query, tempFile, newDistance);
   }
 
-  const selected = results[selectedIndex];
+  const selected = resultsWithEntries[selectedIndex];
+  if (!selected?.entry) {
+    logger.error('Selected result has no entry attached');
+    return;
+  }
+
   console.log('\nExtracting full conversation...');
 
   try {
     const conversation = await extractConversation(selected.entry.filePath, selected.entry.sessionId!);
     await copyToClipboard(conversation);
 
-    console.log('\n✅ Full conversation copied to clipboard!');
+    console.log('\nFull conversation copied to clipboard!');
     console.log(`\nConversation details:`);
     console.log(`  Project: ${selected.entry.projectPath.replace(/-/g, '/')}`);
     console.log(`  Session: ${selected.entry.sessionId}`);
     console.log(`  File: ${selected.entry.filePath}`);
   } catch (error) {
-    console.error('\n❌ Error:', error);
-    process.exit(1);
+    logger.error('Failed to extract conversation', error as Error);
   }
 }
 
 async function main() {
   const args = process.argv.slice(2);
 
+  // Check for debug flag
+  if (args.includes('--debug')) {
+    setDebugMode(true);
+    args.splice(args.indexOf('--debug'), 1);
+  }
+
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp();
+    return;
+  }
+
   if (args.length === 0) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
-  const { query, options } = parseArgs(args);
+  const { query, options } = parseArgs(args, { topK: INTERACTIVE_TOP_K });
 
   if (!query) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    validateSearchOptions(options);
+  } catch (error) {
+    console.error(`Error: ${(error as Error).message}\n`);
+    printHelp();
+    process.exitCode = 1;
+    return;
   }
 
   console.log('Extracting text from Claude projects...');
@@ -590,26 +548,18 @@ async function main() {
 
   if (results.length === 0) {
     console.log('No results found.');
-    process.exit(0);
+    return;
   }
 
-  // Attach entries to results
-  for (const result of results) {
-    result.entry = entries[result.lineNumber];
+  const resultsWithEntries = sortByDistance(attachEntries(results, entries));
+
+  console.log(`Found ${resultsWithEntries.length} result(s).`);
+
+  if (resultsWithEntries.length > MAX_RESULTS_DISPLAY) {
+    return await handleTooManyResults(resultsWithEntries.length, query, entries, tempFile);
   }
 
-  // Sort by distance (best matches first)
-  results.sort((a, b) => a.distance - b.distance);
-
-  console.log(`Found ${results.length} result(s).`);
-
-  // Check if too many results - offer refinement
-  if (results.length > 25) {
-    return await handleTooManyResults(results.length, query, entries, tempFile);
-  }
-
-  // Continue with normal display and copy flow
-  await displayResultsAndCopy(results, entries, query);
+  await displayResultsAndCopy(resultsWithEntries, entries, query, tempFile);
 }
 
 main();
