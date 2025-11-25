@@ -2,53 +2,23 @@
 
 import { spawn } from "child_process";
 import { join } from "path";
-import { createReadStream, createWriteStream } from "fs";
+import { createWriteStream } from "fs";
 import { createInterface } from "readline";
-import { tmpdir } from "os";
-import { mkdir } from "fs/promises";
+import {
+  parseArgs,
+  validateSearchOptions,
+  getGlobalTempManager,
+  parseSearchOutput,
+  Logger,
+  setDebugMode,
+  DEFAULT_TOP_K,
+  DEFAULT_CONTEXT,
+  TRUNCATE_TEXT_LENGTH,
+} from "./src";
+import type { SearchOptions, TextEntry } from "./src";
 
-interface SearchOptions {
-  topK?: number;
-  maxDistance?: number;
-  context?: number;
-}
-
-interface TextEntry {
-  text: string;
-  filePath: string;
-  projectPath: string;
-  timestamp?: string;
-  role?: string;
-  sessionId?: string;
-}
-
-function parseArgs(args: string[]): { query: string; options: SearchOptions } {
-  const options: SearchOptions = {
-    topK: 3,
-    context: 3,
-  };
-
-  let query = '';
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-
-    if (arg === '--top-k' && i + 1 < args.length) {
-      options.topK = parseInt(args[++i], 10);
-    } else if (arg === '--max-distance' && i + 1 < args.length) {
-      options.maxDistance = parseFloat(args[++i]);
-    } else if (arg === '--context' && i + 1 < args.length) {
-      options.context = parseInt(args[++i], 10);
-    } else if (arg === '--help' || arg === '-h') {
-      printHelp();
-      process.exit(0);
-    } else if (!arg.startsWith('--')) {
-      query = arg;
-    }
-  }
-
-  return { query, options };
-}
+const logger = new Logger('search-context');
+const tempManager = getGlobalTempManager();
 
 function printHelp() {
   console.log(`
@@ -60,9 +30,10 @@ Arguments:
   <query>               Search query (semantic matching)
 
 Options:
-  --top-k <number>      Number of results to return (default: 3)
+  --top-k <number>      Number of results to return (default: ${DEFAULT_TOP_K})
   --max-distance <num>  Maximum cosine distance threshold (0.0+)
-  --context <number>    Lines of context before/after match (default: 3)
+  --context <number>    Lines of context before/after match (default: ${DEFAULT_CONTEXT})
+  --debug               Enable debug logging
   -h, --help           Show this help message
 
 Examples:
@@ -74,7 +45,7 @@ Examples:
 
 async function extractMetadata(): Promise<{ entries: TextEntry[]; tempFile: string }> {
   const extractScript = join(import.meta.dir, 'extract-with-metadata.ts');
-  const tempFile = join(tmpdir(), `llmgrep-${Date.now()}.txt`);
+  const tempFile = await tempManager.create('llmgrep-context');
 
   return new Promise((resolve, reject) => {
     const entries: TextEntry[] = [];
@@ -93,10 +64,9 @@ async function extractMetadata(): Promise<{ entries: TextEntry[]; tempFile: stri
       try {
         const entry: TextEntry = JSON.parse(line);
         entries.push(entry);
-        // Store text with newlines replaced for search
         textLines.push(entry.text.replace(/\n/g, ' '));
       } catch (error) {
-        // Skip invalid lines
+        logger.skippedLine(line, error as Error);
       }
     });
 
@@ -108,7 +78,6 @@ async function extractMetadata(): Promise<{ entries: TextEntry[]; tempFile: stri
         return;
       }
 
-      // Write text lines to temp file for search
       const writeStream = createWriteStream(tempFile);
       for (const line of textLines) {
         writeStream.write(line + '\n');
@@ -127,7 +96,7 @@ async function performSearch(
   options: SearchOptions
 ): Promise<Array<{ lineNumber: number; distance: number }>> {
   return new Promise((resolve, reject) => {
-    const searchArgs = [query, tempFile, '-n', '0']; // No context, we'll add it ourselves
+    const searchArgs = [query, tempFile, '-n', '0'];
 
     if (options.maxDistance !== undefined) {
       searchArgs.push('-m', options.maxDistance.toString());
@@ -144,7 +113,7 @@ async function performSearch(
       output += data.toString();
     });
 
-    search.on('error', (error) => {
+    search.on('error', () => {
       reject(new Error('Make sure "search" command is installed (npm install -g @llamaindex/semtools)'));
     });
 
@@ -154,22 +123,7 @@ async function performSearch(
         return;
       }
 
-      // Parse search output
-      const results: Array<{ lineNumber: number; distance: number }> = [];
-      const lines = output.split('\n');
-
-      for (const line of lines) {
-        // Match format: filename:123::456 (0.123456) or <stdin>:123::456 (0.123456)
-        const match = line.match(/^[^:]+:(\d+)::(\d+)\s+\(([0-9.]+)\)/);
-        if (match) {
-          results.push({
-            lineNumber: parseInt(match[1], 10),
-            distance: parseFloat(match[3]),
-          });
-        }
-      }
-
-      resolve(results);
+      resolve(parseSearchOutput(output));
     });
   });
 }
@@ -188,9 +142,8 @@ function formatResult(entry: TextEntry, distance: number, index: number) {
   console.log(`Session: ${entry.sessionId}`);
   console.log(`${'-'.repeat(80)}`);
 
-  // Show text with some formatting
-  const text = entry.text.length > 500
-    ? entry.text.substring(0, 500) + '...'
+  const text = entry.text.length > TRUNCATE_TEXT_LENGTH
+    ? entry.text.substring(0, TRUNCATE_TEXT_LENGTH) + '...'
     : entry.text;
   console.log(text);
   console.log('');
@@ -199,10 +152,22 @@ function formatResult(entry: TextEntry, distance: number, index: number) {
 async function main() {
   const args = process.argv.slice(2);
 
+  // Check for debug flag
+  if (args.includes('--debug')) {
+    setDebugMode(true);
+    args.splice(args.indexOf('--debug'), 1);
+  }
+
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp();
+    return;
+  }
+
   if (args.length === 0) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const { query, options } = parseArgs(args);
@@ -210,7 +175,17 @@ async function main() {
   if (!query) {
     console.error('Error: Query is required\n');
     printHelp();
-    process.exit(1);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    validateSearchOptions(options);
+  } catch (error) {
+    console.error(`Error: ${(error as Error).message}\n`);
+    printHelp();
+    process.exitCode = 1;
+    return;
   }
 
   console.log('Extracting text from Claude projects...');
@@ -222,23 +197,18 @@ async function main() {
 
   if (results.length === 0) {
     console.log('No results found.');
-    process.exit(0);
+    return;
   }
 
   console.log(`Found ${results.length} result(s):\n`);
 
   for (let i = 0; i < results.length; i++) {
-    const result = results[i];
+    const result = results[i]!;
     const entry = entries[result.lineNumber];
     if (entry) {
       formatResult(entry, result.distance, i);
     }
   }
-
-  // Clean up temp file
-  try {
-    await Bun.write(tempFile, '');
-  } catch {}
 }
 
 main();
