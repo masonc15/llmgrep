@@ -487,7 +487,7 @@ async function displayResultsAndCopy(
   console.log('\nExtracting full conversation...');
 
   try {
-    const conversation = await extractConversation(selected.entry.filePath, selected.entry.sessionId!);
+    const conversation = await extractConversation(selected.entry.filePath);
     await copyToClipboard(conversation);
 
     console.log('\nFull conversation copied to clipboard!');

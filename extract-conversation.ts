@@ -45,7 +45,7 @@ interface ConversationEntry {
   }>;
 }
 
-export async function extractConversation(filePath: string, sessionId: string): Promise<string> {
+export async function extractConversation(filePath: string): Promise<string> {
   const fileStream = createReadStream(filePath);
   const rl = createInterface({
     input: fileStream,
