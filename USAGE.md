@@ -1,155 +1,140 @@
-# llmgrep - Quick Usage Guide
+# Usage
+
+llmgrep supports two primary modes: interactive (default) and plain text output. The tool searches your Claude Code conversation history stored in `~/.claude/projects/`.
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-bun install
-
-# Search and select interactively (default)
-bun run index.ts "your search query"
-
-# Or use the npm script
-bun search "your search query"
+llmgrep "your search query"
 ```
 
-## Interactive Workflow
+This runs an interactive semantic search. Navigate results with arrow keys, press Enter to copy the full conversation to your clipboard.
 
-1. **Run a search**
-   ```bash
-   bun run index.ts "authentication methods"
-   ```
+## Search Modes
 
-2. **Browse results**
-   - Use `↑` and `↓` arrow keys to navigate
-   - Results are sorted by relevance (lower % = better match)
-   - Each result shows: `[distance%] date | role | project path`
-   - Preview text is shown below each result
-
-3. **Select a conversation**
-   - Press `Enter` to select
-   - The full conversation (including all tool uses and results) will be copied to clipboard
-   - Or select "❌ Cancel" to exit
-
-4. **Paste the conversation**
-   - The entire conversation is now in your clipboard
-   - Paste it anywhere: another Claude conversation, a file, documentation, etc.
-
-## Command Options
+### Interactive Mode (Default)
 
 ```bash
-# Show more results (default is 10)
-bun run index.ts "query" --top-k 20
-
-# Filter by maximum distance (lower = more similar)
-bun run index.ts "query" --max-distance 0.3
-
-# Use plain text output (no interactive menu)
-bun run index.ts "query" --no-interactive
+llmgrep "authentication flow"
 ```
 
-## What Gets Copied
+Displays a visual results list with relevance bars, dates, and project names. Select a result to copy the entire conversation to clipboard.
 
-When you select a conversation, you get:
+Interactive mode automatically expands the search if no results are found at the default threshold.
 
-- **All user messages** with timestamps
-- **All assistant messages** with timestamps
-- **All tool uses** with full input parameters
-- **All tool results** with complete output
-- Formatted for easy reading
-
-## Example Queries
+### Plain Text Mode
 
 ```bash
-# Find conversations about specific topics
-bun run index.ts "authentication"
-bun run index.ts "database schema"
-bun run index.ts "error handling"
-
-# Find conversations about bugs
-bun run index.ts "bug in login form"
-bun run index.ts "fixing the API"
-
-# Find conversations about technologies
-bun run index.ts "react hooks"
-bun run index.ts "typescript generics"
-bun run index.ts "docker setup"
-
-# Find conversations about features
-bun run index.ts "implementing search"
-bun run index.ts "adding pagination"
+llmgrep "authentication flow" --no-interactive
 ```
 
-## Tips
+Outputs formatted results directly to stdout. Useful for piping to other tools or when you just need to read the matches.
 
-- **Be specific**: More specific queries return better results
-- **Use keywords**: Include important technical terms
-- **Check the distance**: Lower percentages mean better matches
-- **Browse multiple results**: Sometimes the 2nd or 3rd result is more relevant
-- **Use --top-k**: If you don't see what you want, increase the result count
+## Threshold Presets
 
-## Keyboard Shortcuts
+Control how closely results must match your query:
 
-In the interactive menu:
-- `↑` / `↓` - Navigate results
-- `Enter` - Select and copy conversation
-- `Ctrl+C` - Cancel/exit
-
-## npm Scripts
+| Flag | Distance | Description |
+|------|----------|-------------|
+| `--strict` or `-s` | < 0.30 | Very specific matches only |
+| `--precise` or `-p` | < 0.40 | High quality matches (default) |
+| `--broad` or `-b` | < 0.55 | Cast a wider net |
 
 ```bash
-# Interactive search (default)
-bun search "query"
-
-# Direct interactive (same as above)
-bun interactive "query"
-
-# Plain text output
-bun plain "query"
-
-# Extract all text (for debugging)
-bun extract
+llmgrep "react hooks" --strict     # Only near-exact matches
+llmgrep "bug fixes" --broad        # Include loosely related results
 ```
 
-## Troubleshooting
+### Custom Threshold
 
-### "search command not found"
-Install semtools:
+Set an exact distance threshold with `--max-distance` or `-m`:
+
 ```bash
-npm install -g @llamaindex/semtools
+llmgrep "database schema" -m 0.35
 ```
 
-### "No results found"
-- Try a broader query
-- Increase --max-distance: `--max-distance 0.5`
-- Check that you have conversation history in `~/.claude/projects/`
+Values range from 0.0 (exact match) to 1.0 (completely unrelated). Lower values are stricter.
 
-### "Failed to copy to clipboard"
-- **macOS**: Should work out of the box (uses `pbcopy`)
-- **Linux**: Install `xclip`: `sudo apt-get install xclip`
-- **Windows**: Should work out of the box (uses `clip`)
+## Date Filtering
 
-## Advanced Usage
-
-### Pipe to other tools
+Narrow results to a specific time range:
 
 ```bash
-# Extract and search with custom tools
-bun extract | grep "authentication"
-
-# Get metadata for all conversations
-bun run extract-with-metadata.ts | jq '.projectPath' | sort | uniq
+llmgrep "refactoring" --after 2025-01-01
+llmgrep "deployment" --before 2025-06-15
+llmgrep "testing" --after 2025-01-01 --before 2025-03-01
 ```
 
-### Custom filtering
+Dates use YYYY-MM-DD format.
+
+## Result Limits
+
+Control how many results to display:
 
 ```bash
-# Very strict filtering (only very similar results)
-bun run index.ts "query" --max-distance 0.2
+llmgrep "api endpoints" --limit 5
+llmgrep "error handling" -l 20
+```
 
-# Relaxed filtering (more diverse results)
-bun run index.ts "query" --max-distance 0.6
+Default limit is 10 results.
 
-# Many results for browsing
-bun run index.ts "query" --top-k 50
+## Development Scripts
+
+Run specific components directly with bun:
+
+```bash
+bun run search        # Interactive search (same as llmgrep)
+bun run interactive   # Interactive search directly
+bun run plain         # Plain text output
+bun run extract       # Extract raw text from all conversations
+```
+
+## All Options
+
+```
+llmgrep <query> [options]
+
+Threshold Options:
+  --strict, -s          Very specific matches only (distance < 0.30)
+  --precise, -p         High quality matches (distance < 0.40) [default]
+  --broad, -b           Cast a wider net (distance < 0.55)
+  --max-distance, -m    Custom distance threshold (0.0-1.0)
+  --top-k <number>      Number of results to return
+
+Filter Options:
+  --after <date>        Only results after YYYY-MM-DD
+  --before <date>       Only results before YYYY-MM-DD
+  --limit, -l <n>       Max results to display (default: 10)
+
+Other Options:
+  --no-interactive      Use plain text output instead of interactive mode
+  --context <number>    Lines of context before/after match
+  --debug               Enable debug logging
+  -h, --help            Show help message
+```
+
+## Examples
+
+Search for authentication discussions from this year:
+
+```bash
+llmgrep "oauth implementation" --after 2025-01-01
+```
+
+Find all debugging sessions with loose matching:
+
+```bash
+llmgrep "debugging" --broad --limit 20
+```
+
+Quick lookup with strict matching:
+
+```bash
+llmgrep "useState hook" -s
+```
+
+Pipe to grep for further filtering:
+
+```bash
+llmgrep "api" --no-interactive | grep -i "error"
 ```
