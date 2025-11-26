@@ -14,6 +14,9 @@ import {
   DEFAULT_TOP_K,
   DEFAULT_CONTEXT,
   TRUNCATE_TEXT_LENGTH,
+  THRESHOLD_STRICT,
+  THRESHOLD_PRECISE,
+  THRESHOLD_BROAD,
 } from "./src";
 import type { SearchOptions, TextEntry } from "./src";
 
@@ -29,17 +32,22 @@ Usage: bun run search-with-context.ts <query> [options]
 Arguments:
   <query>               Search query (semantic matching)
 
-Options:
+Threshold Options:
+  --strict, -s          Very specific matches only (distance < ${THRESHOLD_STRICT})
+  --precise, -p         High quality matches (distance < ${THRESHOLD_PRECISE})
+  --broad, -b           Cast a wider net (distance < ${THRESHOLD_BROAD})
+  --max-distance, -m    Custom distance threshold (0.0-1.0)
   --top-k <number>      Number of results to return (default: ${DEFAULT_TOP_K})
-  --max-distance <num>  Maximum cosine distance threshold (0.0+)
+
+Other Options:
   --context <number>    Lines of context before/after match (default: ${DEFAULT_CONTEXT})
   --debug               Enable debug logging
-  -h, --help           Show this help message
+  -h, --help            Show this help message
 
 Examples:
-  bun run search-with-context.ts "authentication methods" --top-k 5
-  bun run search-with-context.ts "bug in user registration" --max-distance 0.3
-  bun run search-with-context.ts "react hooks" --context 5
+  bun run search-with-context.ts "authentication methods" --strict
+  bun run search-with-context.ts "bug in user registration" -m 0.3
+  bun run search-with-context.ts "react hooks" --broad
 `);
 }
 
