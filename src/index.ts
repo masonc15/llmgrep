@@ -5,3 +5,4 @@ export * from "./cleanup";
 export * from "./spawn";
 export * from "./search-result";
 export * from "./logger";
+export * from "./spinner";
